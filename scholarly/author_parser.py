@@ -6,7 +6,7 @@ _CITATIONAUTHRE = r'user=([\w-]*)'
 _HOST = 'https://scholar.google.com{0}'
 _PAGESIZE = 100
 _EMAILAUTHORRE = r'Verified email at '
-_CITATIONAUTH = '/citations?hl=en&user={0}'
+_CITATIONAUTH = '/citations?hl=en&user={0}&sortby=pubdate'
 
 
 class AuthorParser:
