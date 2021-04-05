@@ -51,6 +51,7 @@ class _SearchScholarIterator(object):
         self._url = url
         self._nav = nav
         self._load_url(url)
+        self.total_results = self._get_total_results()
         self.pub_parser = PublicationParser(self._nav)
 
     def _load_url(self, url: str):
@@ -58,6 +59,14 @@ class _SearchScholarIterator(object):
         self._soup = self._nav._get_soup(url)
         self._pos = 0
         self._rows = self._soup.find_all('div', class_='gs_r gs_or gs_scl')
+
+    def _get_total_results(self):
+        for x in self._soup.find_all('div', class_='gs_ab_mdw'):
+            # Decimal separator is set by Google independent of language setting
+            match = re.match(pattern=r'(^|\s*About)\s*([0-9,\.]+)', string=x.text)
+            if match:
+                return int(re.sub(pattern=r'[,\.]',repl='', string=match.group(2)))
+        return None
 
     # Iterator protocol
 
@@ -73,6 +82,7 @@ class _SearchScholarIterator(object):
         elif self._soup.find(class_='gs_ico gs_ico_nav_next'):
             url = self._soup.find(
                 class_='gs_ico gs_ico_nav_next').parent['href']
+            self._url = url
             self._load_url(url)
             return self.__next__()
         else:
@@ -234,6 +244,9 @@ class PublicationParser(object):
             if 'Cited by' in link.text:
                 publication['num_citations'] = int(re.findall(r'\d+', link.text)[0].strip())
                 publication['citedby_url'] = link['href']
+            
+            if 'Related articles' in link.text:
+                publication['url_related_articles'] = link['href']
 
         if __data.find('div', class_='gs_ggs gs_fl'):
             publication['eprint_url'] = __data.find(
@@ -257,7 +270,7 @@ class PublicationParser(object):
             for item in soup.find_all('div', class_='gs_scl'):
                 key = item.find(class_='gsc_vcd_field').text.strip().lower()
                 val = item.find(class_='gsc_vcd_value')
-                if key == 'authors':
+                if key == 'authors' or key == 'inventors':
                     publication['bib']['author'] = ' and '.join(
                         [i.strip() for i in val.text.split(',')])
                 elif key == 'journal':
@@ -308,6 +321,10 @@ class PublicationParser(object):
                     publication['cites_id'] = re.findall(
                         _SCHOLARPUBRE, val.a['href'])[0]
                     publication['citedby_url'] = _CITEDBYLINK.format(publication['cites_id'])
+                elif key == 'scholar articles':
+                    for entry in val.find_all('a'):
+                        if entry.text.lower() == 'related articles':
+                            publication['url_related_articles'] = entry.get('href')[26:]
             # number of citation per year
             years = [int(y.text) for y in soup.find_all(class_='gsc_vcd_g_t')]
             cites = [int(c.text) for c in soup.find_all(class_='gsc_vcd_g_al')]

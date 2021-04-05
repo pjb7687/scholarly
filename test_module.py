@@ -180,6 +180,16 @@ class TestScholarly(unittest.TestCase):
 
         self.assertIn('Visual perception of the physical stability of asymmetric three-dimensional objects', pubs)
 
+    def test_search_pubs_total_results(self):
+        """
+        As of February 4, 2021 there are 32 pubs that fit the search term:
+        ["naive physics" stability "3d shape"].
+
+        Check that the total results for that search term equals 32.
+        """
+        pubs = scholarly.search_pubs('"naive physics" stability "3d shape"')
+        self.assertGreaterEqual(pubs.total_results, 32)
+
     def test_search_pubs_filling_publication_contents(self):
         '''
         This process  checks the process of filling a publication that is derived
@@ -218,7 +228,13 @@ class TestScholarly(unittest.TestCase):
         author_id_list = pub_parser._get_author_id_list(author_html_partial)
         self.assertTrue(author_id_list[3] == 'TEndP-sAAAAJ')
 
+    def test_ScraperAPI(self):
+        proxy_generator = ProxyGenerator()
+        proxy_generator.ScraperAPI(os.getenv('SCRAPER_API_KEY'))
+        scholarly.set_timeout(60)
 
+        ## Uses another method to test that proxy is working.
+        self.test_search_keyword()
 
 
 if __name__ == '__main__':
