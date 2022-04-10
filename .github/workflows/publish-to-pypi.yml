@@ -1,5 +1,7 @@
 name: Publish package to PyPI
-on: push
+on:
+  push:
+    branches: [main]
 
 jobs:
   build-n-publish:
@@ -7,7 +9,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@master
+    - uses: actions/checkout@main
 
     - name: Set up Python 3.8
       uses: actions/setup-python@v1
@@ -26,4 +28,4 @@ jobs:
       if: startsWith(github.event.ref, 'refs/tags')
       uses: pypa/gh-action-pypi-publish@master
       with:
-        password: ${{ secrets.pypi_password }}        
+        password: ${{ secrets.pypi_password }}

@@ -1,12 +1,18 @@
 from .publication_parser import PublicationParser
 import re
-from .data_types import Author, AuthorSource, PublicationSource
+from .data_types import Author, AuthorSource, PublicationSource, PublicAccess
+from selenium.webdriver.common.by import By
+import codecs
 
 _CITATIONAUTHRE = r'user=([\w-]*)'
 _HOST = 'https://scholar.google.com{0}'
 _PAGESIZE = 100
 _EMAILAUTHORRE = r'Verified email at '
 _CITATIONAUTH = '/citations?hl=en&user={0}&sortby=pubdate'
+_COAUTH = ('https://scholar.google.com/citations?user={0}&hl=en'
+           '#d=gsc_md_cod&u=%2Fcitations%3Fview_op%3Dlist_colleagues'
+           '%26hl%3Den%26json%3D%26user%3D{0}%23t%3Dgsc_cod_lc')
+_MANDATES = "/citations?hl=en&tzom=300&user={0}&view_op=list_mandates&pagesize={1}"
 
 
 class AuthorParser:
@@ -14,17 +20,18 @@ class AuthorParser:
 
     def __init__(self, nav):
         self.nav = nav
-        self._sections = {'basics',
+        self._sections = ['basics',
                           'indices',
                           'counts',
                           'coauthors',
-                          'publications'}
-    
+                          'publications',
+                          'public_access']
+
     def get_author(self, __data)->Author:
         """ Fills the information for an author container
         """
         author: Author = {'container_type': 'Author'}
-        author['filled'] = set()
+        author['filled'] = []
         if isinstance(__data, str):
             author['scholar_id'] = __data
             author['source'] = AuthorSource.AUTHOR_PROFILE_PAGE
@@ -49,8 +56,11 @@ class AuthorParser:
                 author['email_domain'] = re.sub(_EMAILAUTHORRE, r'@', email.text)
 
             int_class = self._find_tag_class_name(__data, 'a', 'one_int')
-            interests = __data.find_all('a', class_=int_class)
-            author['interests'] = [i.text.strip() for i in interests]
+            if int_class:
+                interests = __data.find_all('a', class_=int_class)
+                author['interests'] = [i.text.strip() for i in interests]
+            else:
+                author['interests'] = []
 
             citedby_class = self._find_tag_class_name(__data, 'div', 'cby')
             citedby = __data.find('div', class_=citedby_class)
@@ -70,21 +80,30 @@ class AuthorParser:
         author['name'] = soup.find('div', id='gsc_prf_in').text
         if author['source'] == AuthorSource.AUTHOR_PROFILE_PAGE:
             res = soup.find('img', id='gsc_prf_pup-img')
-            if res != None:
+            if res is not None:
                 if "avatar_scholar" not in res['src']:
                     author['url_picture'] = res['src']
-        author['affiliation'] = soup.find('div', class_='gsc_prf_il').text
-        author['interests'] = [i.text.strip() for i in
-                          soup.find_all('a', class_='gsc_prf_inta')]
-        if author['source'] == AuthorSource.AUTHOR_PROFILE_PAGE:
-            email = soup.find('div', id="gsc_prf_ivh", class_="gsc_prf_il")
-            if email.text != "No verified email":
-                author['email_domain'] = '@'+email.text.split(" ")[3]
-        if author['source'] == AuthorSource.CO_AUTHORS_LIST:
+        elif author['source'] == AuthorSource.CO_AUTHORS_LIST:
             picture = soup.find('img', id="gsc_prf_pup-img").get('src')
             if "avatar_scholar" in picture:
                 picture = _HOST.format(picture)
             author['url_picture'] = picture
+
+        affiliation = soup.find('div', class_='gsc_prf_il')
+        author['affiliation'] = affiliation.text
+        affiliation_link = affiliation.find('a')
+        if affiliation_link:
+            author['organization'] = int(affiliation_link.get('href').split("org=")[-1])
+        author['interests'] = [i.text.strip() for i in
+                          soup.find_all('a', class_='gsc_prf_inta')]
+        email = soup.find('div', id="gsc_prf_ivh", class_="gsc_prf_il")
+        if author['source'] == AuthorSource.AUTHOR_PROFILE_PAGE:
+            if email.text != "No verified email":
+                author['email_domain'] = '@'+email.text.split(" ")[3]
+        homepage = email.find('a', class_="gsc_prf_ila")
+        if homepage:
+            author['homepage'] = homepage.get('href')
+
         index = soup.find_all('td', class_='gsc_rsb_std')
         if index:
             author['citedby'] = int(index[0].text)
@@ -111,6 +130,48 @@ class AuthorParser:
                  for c in soup.find_all('span', class_='gsc_g_al')]
         author['cites_per_year'] = dict(zip(years, cites))
 
+    def _fill_public_access(self, soup, author):
+        available = soup.find('div', class_='gsc_rsb_m_a')
+        not_available = soup.find('div', class_='gsc_rsb_m_na')
+        n_available, n_not_available = 0, 0
+        if available:
+            n_available = int(available.text.split(" ")[0])
+        if not_available:
+            n_not_available = int(not_available.text.split(" ")[0])
+
+        author["public_access"] = PublicAccess(available=n_available,
+                                               not_available=n_not_available)
+
+        if 'publications' not in author['filled']:
+            return
+
+        # Make a dictionary mapping to the publications
+        publications = {pub['author_pub_id']:pub for pub in author['publications']}
+        soup = self.nav._get_soup(_MANDATES.format(author['scholar_id'], _PAGESIZE))
+        while True:
+            rows = soup.find_all('div', 'gsc_mnd_sec_na')
+            if rows:
+                for row in rows[0].find_all('a', 'gsc_mnd_art_rvw gs_nph gsc_mnd_link_font'):
+                    author_pub_id = re.findall(r"citation_for_view=([\w:-]*)",
+                                               row['data-href'])[0]
+                    publications[author_pub_id]["public_access"] = False
+
+            rows = soup.find_all('div', 'gsc_mnd_sec_avl')
+            if rows:
+                for row in rows[0].find_all('a', 'gsc_mnd_art_rvw gs_nph gsc_mnd_link_font'):
+                    author_pub_id = re.findall(r"citation_for_view=([\w:-]*)",
+                                               row['data-href'])[0]
+                    publications[author_pub_id]["public_access"] = True
+
+            next_button = soup.find(class_="gs_btnPR")
+            if next_button and "disabled" not in next_button.attrs:
+                url = next_button['onclick'][17:-1]
+                url = codecs.getdecoder("unicode_escape")(url)[0]
+                soup = self.nav._get_soup(url)
+            else:
+                break
+
+
     def _fill_publications(self, soup, author, publication_limit: int = 0, sortby_str: str = ''):
         author['publications'] = list()
         pubstart = 0
@@ -134,14 +195,64 @@ class AuthorParser:
             else:
                 break
 
+    def _get_coauthors_short(self, soup):
+        """Get the short list of coauthors from the profile page.
+
+        To be called by _fill_coauthors method.
+        """
+        coauthors = soup.find_all('span', class_='gsc_rsb_a_desc')
+        coauthor_ids = [re.findall(_CITATIONAUTHRE,
+                        coauth('a')[0].get('href'))[0]
+                        for coauth in coauthors]
+
+        coauthor_names = [coauth.find(tabindex="-1").text
+                          for coauth in coauthors]
+        coauthor_affils = [coauth.find(class_="gsc_rsb_a_ext").text
+                           for coauth in coauthors]
+
+        return coauthor_ids, coauthor_names, coauthor_affils
+
+    def _get_coauthors_long(self, author):
+        """Get the long (>20) list of coauthors.
+
+        Opens the dialog box to get the complete list of coauthors.
+        To be called by _fill_coauthors method.
+        """
+        with self.nav.pm2._get_webdriver() as wd:
+            wd.get(_COAUTH.format(author['scholar_id']))
+            # Wait up to 30 seconds for the various elements to be available.
+            # The wait may be better set elsewhere.
+            wd.implicitly_wait(30)
+            coauthors = wd.find_elements(By.CLASS_NAME, 'gs_ai_pho')
+            coauthor_ids = [re.findall(_CITATIONAUTHRE,
+                            coauth.get_attribute('href'))[0]
+                            for coauth in coauthors]
+            coauthor_names = [name.text for name in
+                              wd.find_elements(By.CLASS_NAME, 'gs_ai_name')]
+            coauthor_affils = [affil.text for affil in
+                               wd.find_elements(By.CLASS_NAME, 'gs_ai_aff')]
+
+            return coauthor_ids, coauthor_names, coauthor_affils
+
     def _fill_coauthors(self, soup, author):
+        # If "View All" is not found, scrape the page for coauthors
+        if not soup.find_all('button', id='gsc_coauth_opn'):
+            coauthor_info = self._get_coauthors_short(soup)
+        else:
+        # If "View All" is found, try opening the dialog box.
+        # If geckodriver is not installed, resort to a short list and warn.
+            try:
+                coauthor_info = self._get_coauthors_long(author)
+            except Exception as err:
+                coauthor_info = self._get_coauthors_short(soup)
+                self.nav.logger.warning(err)
+                self.nav.logger.warning("Fetching only the top 20 coauthors")
+
         author['coauthors'] = []
-        for row in soup.find_all('span', class_='gsc_rsb_a_desc'):
-            new_coauthor = self.get_author(re.findall(
-                _CITATIONAUTHRE, row('a')[0]['href'])[0])
-            new_coauthor['name'] = row.find(tabindex="-1").text
-            new_coauthor['affiliation'] = row.find(
-                class_="gsc_rsb_a_ext").text
+        for coauth_id, coauth_name, coauth_affil in zip(*coauthor_info):
+            new_coauthor = self.get_author(coauth_id)
+            new_coauthor['name'] = coauth_name
+            new_coauthor['affiliation'] = coauth_affil
             new_coauthor['source'] = AuthorSource.CO_AUTHORS_LIST
             author['coauthors'].append(new_coauthor)
 
@@ -156,10 +267,11 @@ class AuthorParser:
             * ``basics``: fills name, affiliation, and interests;
             * ``citations``: fills h-index, i10-index, and 5-year analogues;
             * ``counts``: fills number of citations per year;
+            * ``public_access``: fills number of articles with public access mandates;
             * ``coauthors``: fills co-authors;
             * ``publications``: fills publications;
             * ``[]``: fills all of the above
-        :type sections: ['basics','citations','counts','coauthors','publications',[]] list, optional
+        :type sections: ['basics','citations','counts','public_access','coauthors','publications',[]] list, optional
         :param sortby: Select the order of the citations in the author page. Either by 'citedby' or 'year'. Defaults to 'citedby'.
         :type sortby: string
         :param publication_limit: Select the max number of publications you want you want to fill for the author. Defaults to no limit.
@@ -173,7 +285,8 @@ class AuthorParser:
 
             search_query = scholarly.search_author('Steven A Cholewiak')
             author = next(search_query)
-            scholarly.pprint(author.fill(sections=['basic', 'citation_indices', 'co-authors']))
+            author = scholarly.fill(author, sections=['basics', 'citations', 'coauthors'])
+            scholarly.pprint(author)
 
         :Output::
 
@@ -291,6 +404,7 @@ class AuthorParser:
                             'scholar_id': 'nHx9IgYAAAAJ',
                             'source': 'CO_AUTHORS_LIST'}],
              'email_domain': '@berkeley.edu',
+             'homepage': 'http://steven.cholewiak.com/',
              'filled': False,
              'hindex': 9,
              'hindex5y': 9,
@@ -308,6 +422,7 @@ class AuthorParser:
         """
         try:
             sections = [section.lower() for section in sections]
+            sections.sort(reverse=True)  # Ensure 'publications' comes before 'public_access'
             sortby_str = ''
             if sortby == "year":
                 sortby_str = '&view_op=list_works&sortby=pubdate'
@@ -322,12 +437,12 @@ class AuthorParser:
                 for i in self._sections:
                     if i not in author['filled']:
                         (getattr(self, f'_fill_{i}')(soup, author) if i != 'publications' else getattr(self, f'_fill_{i}')(soup, author, publication_limit, sortby_str))
-                        author['filled'].add(i)
+                        author['filled'].append(i)
             else:
                 for i in sections:
                     if i in self._sections and i not in author['filled']:
                         (getattr(self, f'_fill_{i}')(soup, author) if i != 'publications' else getattr(self, f'_fill_{i}')(soup, author, publication_limit, sortby_str))
-                        author['filled'].add(i)
+                        author['filled'].append(i)
         except Exception as e:
             raise(e)
 

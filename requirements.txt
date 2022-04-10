@@ -1,12 +1,10 @@
 arrow
 beautifulsoup4
 bibtexparser
-PySocks
-requests[security]
-requests[socks]
-stem
+deprecated
 fake_useragent
-selenium
-python-dotenv
 free-proxy
-sphinx_rtd_theme
+python-dotenv
+requests[socks]
+selenium
+stem

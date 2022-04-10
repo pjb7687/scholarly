@@ -2,40 +2,21 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 from __future__ import unicode_literals
-from ._proxy_generator import ProxyGenerator
+from ._proxy_generator import ProxyGenerator, MaxTriesExceededException, DOSException
 
-from typing import Callable
 from bs4 import BeautifulSoup
 
 import codecs
-import hashlib
 import logging
 import random
 import time
-import requests
-import tempfile
-import stem.process
 from requests.exceptions import Timeout
-from selenium import webdriver
-from selenium.webdriver.support.wait import WebDriverWait, TimeoutException
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions
-from selenium.common.exceptions import WebDriverException, UnexpectedAlertPresentException
-from selenium.webdriver.common.desired_capabilities import DesiredCapabilities
-from urllib.parse import urlparse
-from stem import Signal
-from stem.control import Controller
-from fake_useragent import UserAgent
 from .publication_parser import _SearchScholarIterator
 from .author_parser import AuthorParser
 from .publication_parser import PublicationParser
-from .data_types import Author, PublicationSource
+from .data_types import Author, PublicationSource, ProxyMode
 
-class DOSException(Exception):
-    """DOS attack was detected."""
-
-class MaxTriesExceededException(Exception):
-    pass
 
 class Singleton(type):
     _instances = {}
@@ -55,9 +36,13 @@ class Navigator(object, metaclass=Singleton):
         self.logger = logging.getLogger('scholarly')
         self._TIMEOUT = 5
         self._max_retries = 5
-        self._session = None
-        self.pm = ProxyGenerator()
-        self._session = self.pm.get_session()
+        # A Navigator instance has two proxy managers, each with their session.
+        # `pm1` manages the primary, premium proxy.
+        # `pm2` manages the secondary, inexpensive proxy.
+        self.pm1 = ProxyGenerator()
+        self.pm2 = ProxyGenerator()
+        self._session1 = self.pm1.get_session()
+        self._session2 = self.pm2.get_session()
         self.got_403 = False
 
 
@@ -71,43 +56,62 @@ class Navigator(object, metaclass=Singleton):
         if timeout >= 0:
             self._TIMEOUT = timeout
 
-    def use_proxy(self, pg: ProxyGenerator):
-        if pg is not None:
-            self.pm = pg
+    def use_proxy(self, pg1: ProxyGenerator, pg2: ProxyGenerator = None):
+        if pg1 is not None:
+            self.pm1 = pg1
+
+        if pg2 is not None:
+            self.pm2 = pg2
         else:
-            self.pm = ProxyGenerator()
-        self._session = self.pm.get_session()
+            self.pm2 = ProxyGenerator()
+            proxy_works = self.pm2.FreeProxies()
+            if not proxy_works:
+                self.logger.info("FreeProxy as a secondary proxy is not working. "
+                                 "Using the primary proxy for all requests")
+                self.pm2 = pg1
 
-    def _new_session(self):
+        self._session1 = self.pm1.get_session()
+        self._session2 = self.pm2.get_session()
+
+    def _new_session(self, premium=True):
         self.got_403 = False
-        self._session = self.pm._new_session()
+        if premium:
+            self._session1 = self.pm1._new_session()
+        else:
+            self._session2 = self.pm2._new_session()
 
-    
-    def _get_page(self, pagerequest: str) -> str:
+
+    def _get_page(self, pagerequest: str, premium: bool = False) -> str:
         """Return the data from a webpage
 
         :param pagerequest: the page url
         :type pagerequest: str
+        :param premium: whether or not to use the premium proxy right away
+        :type premium: bool
         :returns: the text from a webpage
         :rtype: {str}
-        :raises: Exception
+        :raises: MaxTriesExceededException, DOSException
         """
         self.logger.info("Getting %s", pagerequest)
         resp = None
         tries = 0
+        if ("citations?" in pagerequest) and (not premium):
+            pm = self.pm2
+            session = self._session2
+            premium = False
+        else:
+            pm = self.pm1
+            session = self._session1
+            premium = True
+        if pm.proxy_mode is ProxyMode.SCRAPERAPI:
+            self.set_timeout(60)
         timeout=self._TIMEOUT
         while tries < self._max_retries:
             try:
                 w = random.uniform(1,2)
                 time.sleep(w)
-                
-                params = {}
-                if self.pm._ScraperAPI_KEY:
-                    params = { 'api_key': self.pm._ScraperAPI_KEY, 'url': pagerequest }
-                    pagerequest = 'http://api.scraperapi.com'
-                
-                resp = self._session.get(pagerequest, params=params, timeout=timeout)
-                self.logger.info("Session proxy config is {}".format(self._session.proxies))
+                resp = session.get(pagerequest, timeout=timeout)
+                self.logger.debug("Session proxy config is {}".format(session.proxies))
 
                 has_captcha = self._requests_has_captcha(resp.text)
 
@@ -115,38 +119,38 @@ class Navigator(object, metaclass=Singleton):
                     return resp.text
                 elif has_captcha:
                     self.logger.info("Got a captcha request.")
-                    self._session = self.pm._handle_captcha2(pagerequest)
-                    continue # Retry request within same session
+                    session = pm._handle_captcha2(pagerequest)
+                    continue  # Retry request within same session
                 elif resp.status_code == 403:
-                    self.logger.info(f"Got an access denied error (403).")
-                    if not self.pm.has_proxy():
+                    self.logger.info("Got an access denied error (403).")
+                    if not pm.has_proxy():
                         self.logger.info("No other connections possible.")
                         if not self.got_403:
                             self.logger.info("Retrying immediately with another session.")
                         else:
-                            if not self.pm._use_luminati:
+                            if pm.proxy_mode not in (ProxyMode.LUMINATI, ProxyMode.SCRAPERAPI):
                                 w = random.uniform(60, 2*60)
-                                self.logger.info("Will retry after {} seconds (with another session).".format(w))
+                                self.logger.info("Will retry after %.2f seconds (with another session).", w)
                                 time.sleep(w)
-                        self._new_session()
+                        self._new_session(premium=premium)
                         self.got_403 = True
-                        
+
                         continue # Retry request within same session
                     else:
                         self.logger.info("We can use another connection... let's try that.")
                 else:
-                    self.logger.info(f"""Response code {resp.status_code}.
-                                    Retrying...""")
+                    self.logger.info("""Response code %d.
+                                    Retrying...""", resp.status_code)
 
             except DOSException:
-                if not self.pm.has_proxy():
+                if not pm.has_proxy():
                     self.logger.info("No other connections possible.")
                     w = random.uniform(60, 2*60)
-                    self.logger.info("Will retry after {} seconds (with the same session).".format(w))
+                    self.logger.info("Will retry after %.2f seconds (with the same session).", w)
                     time.sleep(w)
                     continue
             except Timeout as e:
-                err = f"Timeout Exception %s while fetching page: %s" % (type(e).__name__, e.args)
+                err = "Timeout Exception %s while fetching page: %s" % (type(e).__name__, e.args)
                 self.logger.info(err)
                 if timeout < 3*self._TIMEOUT:
                     self.logger.info("Increasing timeout and retrying within same session.")
@@ -154,13 +158,23 @@ class Navigator(object, metaclass=Singleton):
                     continue
                 self.logger.info("Giving up this session.")
             except Exception as e:
-                err = f"Exception %s while fetching page: %s" % (type(e).__name__, e.args)
+                err = "Exception %s while fetching page: %s" % (type(e).__name__, e.args)
                 self.logger.info(err)
                 self.logger.info("Retrying with a new session.")
 
             tries += 1
-            self._session, timeout = self.pm.get_next_proxy(num_tries = tries, old_timeout = timeout)
-        raise MaxTriesExceededException("Cannot Fetch from Google Scholar.")
+            try:
+                session, timeout = pm.get_next_proxy(num_tries = tries, old_timeout = timeout, old_proxy=session.proxies.get('http', None))
+            except Exception:
+                self.logger.info("No other secondary connections possible. "
+                                 "Using the primary proxy for all requests.")
+                break
+
+        # If secondary proxy does not work, try again primary proxy.
+        if not premium:
+            return self._get_page(pagerequest, True)
+        else:
+            raise MaxTriesExceededException("Cannot Fetch from Google Scholar.")
 
 
     def _set_retries(self, num_retries: int) -> None:
@@ -182,15 +196,16 @@ class Navigator(object, metaclass=Singleton):
             lambda c : f'class="{c}"' in text,
         )
 
-    def _webdriver_has_captcha(self) -> bool:
+    def _webdriver_has_captcha(self, premium=True) -> bool:
         """Tests whether the current webdriver page contains a captcha.
 
         :returns: whether or not the site contains a captcha
         :rtype: {bool}
         """
+        pm = self.pm1 if premium else self.pm2
         return self._has_captcha(
-            lambda i : len(self.pm._get_webdriver().find_elements(By.ID, i)) > 0,
-            lambda c : len(self.pm._get_webdriver().find_elements(By.CLASS_NAME, c)) > 0,
+            lambda i : len(pm._get_webdriver().find_elements(By.ID, i)) > 0,
+            lambda c : len(pm._get_webdriver().find_elements(By.CLASS_NAME, c)) > 0,
         )
 
     def _has_captcha(self, got_id, got_class) -> bool:
@@ -220,7 +235,7 @@ class Navigator(object, metaclass=Singleton):
     def search_authors(self, url: str)->Author:
         """Generator that returns Author objects from the author search page"""
         soup = self._get_soup(url)
-         
+
         author_parser = AuthorParser(self)
         while True:
             rows = soup.find_all('div', 'gsc_1usr')
