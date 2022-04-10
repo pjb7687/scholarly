@@ -1,19 +1,18 @@
 import re
 import bibtexparser
 import arrow
-import pprint
 from bibtexparser.bibdatabase import BibDatabase
-from .data_types import BibEntry, Publication, PublicationSource
+from .data_types import BibEntry, Mandate, Publication, PublicationSource
 
 
-_HOST = 'https://scholar.google.com{0}'
-_SCHOLARPUBRE = r'cites=([\w-]*)'
+_SCHOLARPUBRE = r'cites=([\d,]*)'
 _CITATIONPUB = '/citations?hl=en&view_op=view_citation&citation_for_view={0}'
 _SCHOLARPUB = '/scholar?hl=en&oi=bibs&cites={0}'
 _CITATIONPUBRE = r'citation_for_view=([\w-]*:[\w-]*)'
 _BIBCITE = '/scholar?q=info:{0}:scholar.google.com/\
 &output=cite&scirp={1}&hl=en'
 _CITEDBYLINK = '/scholar?cites={0}'
+_MANDATES_URL = '/citations?view_op=view_mandate&hl=en&citation_for_view={0}'
 
 _BIB_MAPPING = {
     'ENTRYTYPE': 'pub_type',
@@ -49,6 +48,7 @@ class _SearchScholarIterator(object):
 
     def __init__(self, nav, url: str):
         self._url = url
+        self._pubtype = PublicationSource.PUBLICATION_SEARCH_SNIPPET if "/scholar?" in url else PublicationSource.JOURNAL_CITATION_LIST
         self._nav = nav
         self._load_url(url)
         self.total_results = self._get_total_results()
@@ -58,15 +58,19 @@ class _SearchScholarIterator(object):
         # this is temporary until setup json file
         self._soup = self._nav._get_soup(url)
         self._pos = 0
-        self._rows = self._soup.find_all('div', class_='gs_r gs_or gs_scl')
+        self._rows = self._soup.find_all('div', class_='gs_r gs_or gs_scl') + self._soup.find_all('div', class_='gsc_mpat_ttl')
 
     def _get_total_results(self):
+        if self._soup.find("div", class_="gs_pda"):
+            return None
+
         for x in self._soup.find_all('div', class_='gs_ab_mdw'):
-            # Decimal separator is set by Google independent of language setting
-            match = re.match(pattern=r'(^|\s*About)\s*([0-9,\.]+)', string=x.text)
+            # Accounting for different thousands separators:
+            # comma, dot, space, apostrophe
+            match = re.match(pattern=r'(^|\s*About)\s*([0-9,\.\s’]+)', string=x.text)
             if match:
-                return int(re.sub(pattern=r'[,\.]',repl='', string=match.group(2)))
-        return None
+                return int(re.sub(pattern=r'[,\.\s’]',repl='', string=match.group(2)))
+        return 0
 
     # Iterator protocol
 
@@ -77,7 +81,7 @@ class _SearchScholarIterator(object):
         if self._pos < len(self._rows):
             row = self._rows[self._pos]
             self._pos += 1
-            res = self.pub_parser.get_publication(row, PublicationSource.PUBLICATION_SEARCH_SNIPPET)
+            res = self.pub_parser.get_publication(row, self._pubtype)
             return res
         elif self._soup.find(class_='gs_ico gs_ico_nav_next'):
             url = self._soup.find(
@@ -114,13 +118,15 @@ class PublicationParser(object):
         publication["num_citations"] = 0
         if citedby and not (citedby.text.isspace() or citedby.text == ''):
             publication["num_citations"] = int(citedby.text.strip())
+            publication["citedby_url"] = citedby["href"]
+            publication["cites_id"] = re.findall(_SCHOLARPUBRE, citedby["href"])[0].split(',')
 
         year = __data.find(class_='gsc_a_h')
         if (year and year.text
                 and not year.text.isspace()
                 and len(year.text) > 0):
             publication['bib']['pub_year'] = year.text.strip()
-        
+
         return publication
 
     def get_publication(self, __data, pubtype: PublicationSource)->Publication:
@@ -136,6 +142,9 @@ class PublicationParser(object):
             return self._citation_pub(__data, publication)
         elif publication['source'] == PublicationSource.PUBLICATION_SEARCH_SNIPPET:
             return self._scholar_pub(__data, publication)
+        elif publication['source'] == PublicationSource.JOURNAL_CITATION_LIST:
+            return publication
+            # TODO: self._journal_pub(__data, publication)
         else:
             return publication
 
@@ -163,7 +172,7 @@ class PublicationParser(object):
             match = re.search('\\?user=(.*?)&amp;', author_html)
             if match:
                 author_id_list.append(match.groups()[0])
-            else: 
+            else:
                 author_id_list.append("")
         return author_id_list
 
@@ -229,22 +238,19 @@ class PublicationParser(object):
             if publication['bib']['abstract'][0:8].lower() == 'abstract':
                 publication['bib']['abstract'] = publication['bib']['abstract'][9:].strip()
 
+        publication['url_scholarbib'] = _BIBCITE.format(cid, pos)
+        sclib = self.nav.publib.format(id=cid)
+        publication['url_add_sclib'] = sclib
+
         lowerlinks = databox.find('div', class_='gs_fl').find_all('a')
 
         publication["num_citations"] = 0
 
         for link in lowerlinks:
-            if (link is not None and
-                    link.get('title') is not None and
-                    'Cite' == link.get('title')):
-                publication['url_scholarbib'] = _BIBCITE.format(cid, pos)
-                sclib = self.nav.publib.format(id=cid)
-                publication['url_add_sclib'] = sclib
-
             if 'Cited by' in link.text:
                 publication['num_citations'] = int(re.findall(r'\d+', link.text)[0].strip())
                 publication['citedby_url'] = link['href']
-            
+
             if 'Related articles' in link.text:
                 publication['url_related_articles'] = link['href']
 
@@ -256,7 +262,7 @@ class PublicationParser(object):
 
     def fill(self, publication: Publication)->Publication:
         """Populate the Publication with information from its profile
-        
+
         :param publication: Scholar or Citation publication container object that is not filled
         :type publication: PublicationCitation or PublicationScholar
         """
@@ -264,6 +270,12 @@ class PublicationParser(object):
             url = _CITATIONPUB.format(publication['author_pub_id'])
             soup = self.nav._get_soup(url)
             publication['bib']['title'] = soup.find('div', id='gsc_oci_title').text
+            if publication['bib']['title'][-1] == '\u2026':
+                merged_snippet = soup.find('div', class_='gsc_oci_merged_snippet')
+                if merged_snippet:
+                    title_div = merged_snippet.find('div')
+                    if title_div:
+                        publication['bib']['title'] = title_div.text
             if soup.find('a', class_='gsc_oci_title_link'):
                 publication['pub_url'] = soup.find(
                     'a', class_='gsc_oci_title_link')['href']
@@ -298,7 +310,7 @@ class PublicationParser(object):
                     # try to find all the gsh_csp if they exist
                     abstract = val.find_all(class_='gsh_csp')
                     result = ""
-                    
+
                     # append all gsh_csp together as there can be multiple in certain scenarios
                     for item in abstract:
                         if item.text[0:8].lower() == 'abstract':
@@ -306,7 +318,7 @@ class PublicationParser(object):
                         else:
                             result += item.text
 
-                    if len(abstract) == 0: # if no gsh_csp were found 
+                    if len(abstract) == 0:  # if no gsh_csp were found
                         abstract = val.find(class_='gsh_small')
                         if abstract:
                             if abstract.text[0:8].lower() == 'abstract':
@@ -319,8 +331,8 @@ class PublicationParser(object):
                     publication['bib']['abstract'] = result
                 elif key == 'total citations':
                     publication['cites_id'] = re.findall(
-                        _SCHOLARPUBRE, val.a['href'])[0]
-                    publication['citedby_url'] = _CITEDBYLINK.format(publication['cites_id'])
+                        _SCHOLARPUBRE, val.a['href'])[0].split(',')
+                    publication['citedby_url'] = _CITEDBYLINK.format(','.join(publication['cites_id']))
                 elif key == 'scholar articles':
                     for entry in val.find_all('a'):
                         if entry.text.lower() == 'related articles':
@@ -338,6 +350,11 @@ class PublicationParser(object):
             if soup.find('div', class_='gsc_vcd_title_ggi'):
                 publication['eprint_url'] = soup.find(
                     'div', class_='gsc_vcd_title_ggi').a['href']
+
+            if publication.get('public_access', None):
+                publication['mandates'] = []
+                self._fill_public_access_mandates(publication)
+
             publication['filled'] = True
         elif publication['source'] == PublicationSource.PUBLICATION_SEARCH_SNIPPET:
             bibtex_url = self._get_bibtex(publication['url_scholarbib'])
@@ -392,3 +409,31 @@ class PublicationParser(object):
             if link.string.lower() == "bibtex":
                 return link.get('href')
         return ''
+
+    def _fill_public_access_mandates(self, publication: Publication) -> None:
+        """Fills the public access mandates"""
+        if publication.get('public_access', None):
+            soup = self.nav._get_soup(_MANDATES_URL.format(publication['author_pub_id']))
+            mandates = soup.find_all('li')
+            for mandate in mandates:
+                m = Mandate()
+                m['agency'] = mandate.find('span', class_='gsc_md_mndt_name').text
+                m['url_policy'] = mandate.find('div', class_='gsc_md_mndt_title').a['href']
+                m['url_policy_cached'] = mandate.find('span', class_='gs_a').a['href']
+                for desc in mandate.find_all('div', class_='gsc_md_mndt_desc'):
+                    match = re.search("Effective date: [0-9]{4}/[0-9]{1,2}", desc.text)
+                    if match:
+                        m['effective_date'] = re.sub(pattern="Effective date: ", repl="",
+                                                     string=desc.text[match.start() : match.end()])
+
+                    match = re.search("Embargo: ", desc.text)
+                    if match:
+                        m['embargo'] = re.sub(pattern="Embargo: ", repl="", string=desc.text[match.end():])
+
+                    if "Grant: " in desc.text:
+                        m['grant'] = desc.text.split("Grant: ")[1]
+
+                    if "Funding acknowledgment" in desc.text:
+                        m['acknowledgement'] = desc.find('span', class_='gs_gray').text
+
+                publication['mandates'].append(m)

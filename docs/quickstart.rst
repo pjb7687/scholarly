@@ -95,10 +95,35 @@ Search for an author by the id visible in the url of an Authors profile.
     {'affiliation': 'Professor of Vision Science, UC Berkeley',
      'email_domain': '@berkeley.edu',
      'filled': False,
+     'homepage': 'http://bankslab.berkeley.edu/',
      'interests': ['vision science', 'psychology', 'human factors', 'neuroscience'],
      'name': 'Martin Banks',
+     'organization': 11816294095661060495,
      'scholar_id': 'Smr99uEAAAAJ',
      'source': 'AUTHOR_PROFILE_PAGE'}
+
+``search_author_by_organization``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Search for authors by organization ID.
+########################################################################
+
+.. code:: python
+
+    >>> scholarly.search_org('Princeton University')
+    [{'Organization': 'Princeton University', 'id': '4836318610601440500'}]
+
+    >>> search_query = scholarly.search_author_by_organization(4836318610601440500)
+    >>> author = next(search_query)
+    >>> scholarly.pprint(author)
+        {'affiliation': 'Princeton University (Emeritus)',
+         'citedby': 438891,
+         'email_domain': '@princeton.edu',
+         'filled': False,
+         'interests': ['Daniel Kahneman'],
+         'name': 'Daniel Kahneman',
+         'scholar_id': 'ImhakoAAAAAJ',
+         'source': 'SEARCH_AUTHOR_SNIPPETS',
+         'url_picture': 'https://scholar.google.com/citations?view_op=medium_photo&user=ImhakoAAAAAJ'}
 
 ``search_keyword``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -123,7 +148,7 @@ Search by keyword and return a generator of Author objects.
      'source': 'SEARCH_AUTHOR_SNIPPETS',
      'url_picture': 'https://scholar.google.com/citations?view_op=medium_photo&user=lHrs3Y4AAAAJ'}
 
-``search_pubs`` 
+``search_pubs``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 Search for articles/publications and return generator of Publication objects.
 #############################################################################
@@ -190,6 +215,7 @@ author information to fill, as follows:
 -  ``'counts'`` = number of citations per year;
 -  ``'coauthors'`` = co-authors;
 -  ``'publications'`` = publications;
+-  ``'public_access'`` = public_access;
 -  ``'[]'`` = all of the above (this is the default)
 
 .. code:: python
@@ -312,6 +338,7 @@ author information to fill, as follows:
      'filled': False,
      'hindex': 9,
      'hindex5y': 9,
+     'homepage': 'http://steven.cholewiak.com/',
      'i10index': 8,
      'i10index5y': 7,
      'interests': ['Depth Cues',
@@ -320,6 +347,7 @@ author information to fill, as follows:
                    'Naive Physics',
                    'Haptics'],
      'name': 'Steven A. Cholewiak, PhD',
+     'organization': 6518679690484165796,
      'scholar_id': '4bahYMkAAAAJ',
      'source': 'SEARCH_AUTHOR_SNIPPETS',
      'url_picture': 'https://scholar.google.com/citations?view_op=medium_photo&user=4bahYMkAAAAJ'}
@@ -363,7 +391,8 @@ Using proxies
 -------------
 
 In general, Google Scholar does not like bots, and can often block
-scholarly. We are actively working towards making scholarly more robust
+scholarly, especially those pages that contain ``scholar?`` in the URL.
+We are actively working towards making scholarly more robust
 towards that front.
 
 The most common solution for avoiding network issues is to use proxies
@@ -387,15 +416,21 @@ Then you need to initialize an object:
 Select the desirered connection type from the following options that
 come from the ProxyGenerator class:
 
--  Tor\_Internal()
--  Tor\_External()
+-  ScraperAPI()
 -  Luminati()
 -  FreeProxies()
--  SingleProxy() Example:
+-  SingleProxy()
+-  Tor\_Internal()
+-  Tor\_External()
+
+All of these methods return ``True`` if the proxy was setup successfully which
+you can check before beginning to use it with the ``use_proxy`` method.
+
+Example:
 
 .. code:: python
 
-    pg.SingleProxy(http = <your http proxy>, https = <your https proxy>)
+    success = pg.SingleProxy(http = <your http proxy>, https = <your https proxy>)
 
 Finally set scholarly to use this proxy for your actions
 
@@ -405,79 +440,52 @@ if you want to use one of the above methods:
 
     scholarly.use_proxy(pg)
 
-or if you want to run it without any proxy:
+`scholarly` is smart enough to know which requests really need proxy, and which do not.
+If you set up a proxy, `scholarly` will by default use `FreeProxies` to fetch pages that will not be actively blocked.
+If you would rather have all requests go through the proxy you set, then pass your `pg` object twice.
 
 .. code:: python
 
-    scholarly.use_proxy(None)
+    scholarly.use_proxy(pg, pg)
 
-``Tor_External``
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-pg.Tor_External(tor_sock_port: int, tor_control_port: int, tor_password: str)
-###############################################################################
+If you want to run it without any proxy (after setting up one):
 
-This option assumes that you have access to a Tor server and a ``torrc``
-file configuring the Tor server to have a control port configured with a
-password; this setup allows scholarly to refresh the Tor ID, if
-scholarly runs into problems accessing Google Scholar.
+.. code:: python
 
-If you want to install and use Tor, then install it using the command
+    pg = ProxyGenerator()
+    scholarly.use_proxy(pg, pg)
 
-::
-
-    sudo apt-get install -y tor
-
-See
-`setup\_tor.sh <https://github.com/scholarly-python-package/scholarly/blob/master/setup_tor.sh>`__
-on how to setup a minimal, working ``torrc`` and set the password for
-the control server. (Note: the script uses ``scholarly_password`` as the
-default password, but you may want to change it for your installation.)
+``ScraperAPI``
+^^^^^^^^^^^^^^
+pg.ScraperAPI()
+###############
 
 .. code:: python
 
     from scholarly import scholarly, ProxyGenerator
 
     pg = ProxyGenerator()
-    pg.Tor_External(tor_sock_port=9050, tor_control_port=9051, tor_password="scholarly_password")
-    scholarly.use_proxy(pg)
 
-    author = next(scholarly.search_author('Steven A Cholewiak'))
-    scholarly.pprint(author)
-
-``Tor_Internal``
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-pg.Tor_internal(tor_cmd=None, tor_sock_port=None, tor_control_port=None)
-########################################################################
-
-If you have Tor installed locally, this option allows scholarly to
-launch its own Tor process. You need to pass a pointer to the Tor
-executable in your system.
+You will have to provide your ScraperAPI key
 
 .. code:: python
 
-    from scholarly import scholarly, ProxyGenerator
+    success = pg.ScraperAPI(YOUR_SCRAPER_API_KEY)
 
-    pg = ProxyGenerator()
-    pg.Tor_Internal(tor_cmd = "tor")
-    scholarly.use_proxy(pg)
+Or alternatively you can use the environment variables as in the case of Luminati example.
 
-    author = next(scholarly.search_author('Steven A Cholewiak'))
-    scholarly.pprint(author)
-
-``FreeProxies``
-^^^^^^^^^^^^^^^^^^^^
-pg.FreeProxies()
-################
-
-This uses the ``free-proxy`` pip library to add a proxy to your
-configuration.
+If you have Startup or higher paid plans, you can use additional options that are allowed for your plan.
 
 .. code:: python
 
-    from scholarly import scholarly, ProxyGenerator
+    success = pg.ScraperAPI(YOUR_SCRAPER_API_KEY, country_code='fr', premium=True, render=True)
 
-    pg = ProxyGenerator()
-    pg.FreeProxies()
+See https://www.scraperapi.com/pricing/ to see which options are enable for your plan.
+
+Finally, you can route your query through the ScraperAPI proxy
+
+.. code:: python
+
     scholarly.use_proxy(pg)
 
     author = next(scholarly.search_author('Steven A Cholewiak'))
@@ -502,7 +510,7 @@ You can use your own configuration
 
 .. code:: python
 
-    pg.Luminati(usr= "your_username",passwd ="your_password", port = "your_port" )
+    success = pg.Luminati(usr= "your_username",passwd ="your_password", port = "your_port" )
 
 Or alternatively you can use the environment variables set in your .env
 file
@@ -514,6 +522,25 @@ file
 
 .. code:: python
 
+    scholarly.use_proxy(pg)
+
+    author = next(scholarly.search_author('Steven A Cholewiak'))
+    scholarly.pprint(author)
+
+``FreeProxies``
+^^^^^^^^^^^^^^^^^^^^
+pg.FreeProxies()
+################
+
+This uses the ``free-proxy`` pip library to add a proxy to your
+configuration.
+
+.. code:: python
+
+    from scholarly import scholarly, ProxyGenerator
+
+    pg = ProxyGenerator()
+    success = pg.FreeProxies()
     scholarly.use_proxy(pg)
 
     author = next(scholarly.search_author('Steven A Cholewiak'))
@@ -531,7 +558,7 @@ If you want to use a proxy of your choice, feel free to use this option.
     from scholarly import scholarly, ProxyGenerator
 
     pg = ProxyGenerator()
-    pg.SingleProxy(http = <your http proxy>, https = <your https proxy>)
+    success = pg.SingleProxy(http = <your http proxy>, https = <your https proxy>)
     scholarly.use_proxy(pg)
 
     author = next(scholarly.search_author('Steven A Cholewiak'))
@@ -539,6 +566,64 @@ If you want to use a proxy of your choice, feel free to use this option.
 
 **NOTE:** Please create a new proxy object whenever you change proxy
 method, as this can lead to unexpected behavior.
+
+``Tor_External``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+pg.Tor_External(tor_sock_port: int, tor_control_port: int, tor_password: str)
+###############################################################################
+
+This method is deprecated since v1.5
+
+This option assumes that you have access to a Tor server and a ``torrc``
+file configuring the Tor server to have a control port configured with a
+password; this setup allows scholarly to refresh the Tor ID, if
+scholarly runs into problems accessing Google Scholar.
+
+If you want to install and use Tor, then install it using the command
+
+::
+
+    sudo apt-get install -y tor
+
+See
+`setup\_tor.sh <https://github.com/scholarly-python-package/scholarly/blob/master/setup_tor.sh>`__
+on how to setup a minimal, working ``torrc`` and set the password for
+the control server. (Note: the script uses ``scholarly_password`` as the
+default password, but you may want to change it for your installation.)
+
+.. code:: python
+
+    from scholarly import scholarly, ProxyGenerator
+
+    pg = ProxyGenerator()
+    success = pg.Tor_External(tor_sock_port=9050, tor_control_port=9051, tor_password="scholarly_password")
+    scholarly.use_proxy(pg)
+
+    author = next(scholarly.search_author('Steven A Cholewiak'))
+    scholarly.pprint(author)
+
+``Tor_Internal``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+pg.Tor_internal(tor_cmd=None, tor_sock_port=None, tor_control_port=None)
+########################################################################
+
+This method is deprecated since v1.5
+
+If you have Tor installed locally, this option allows scholarly to
+launch its own Tor process. You need to pass a pointer to the Tor
+executable in your system.
+
+.. code:: python
+
+    from scholarly import scholarly, ProxyGenerator
+
+    pg = ProxyGenerator()
+    success = pg.Tor_Internal(tor_cmd = "tor")
+    scholarly.use_proxy(pg)
+
+    author = next(scholarly.search_author('Steven A Cholewiak'))
+    scholarly.pprint(author)
+
 
 Setting up environment for Luminati and/or Testing
 --------------------------------------------------
@@ -556,7 +641,8 @@ the working directory of the ``test_module.py`` as:
 
 Define the connection method for the Tests, among these options:
 
--  luminati (if you have a luminati proxy service)
+-  luminati (if you have a Luminati proxy service)
+-  scraperapi (if you have a ScraperAPI proxy service)
 -  freeproxy
 -  tor
 -  tor\_internal
