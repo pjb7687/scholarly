@@ -9,9 +9,9 @@ _SCHOLARPUBRE = r'cites=([\d,]*)'
 _CITATIONPUB = '/citations?hl=en&view_op=view_citation&citation_for_view={0}'
 _SCHOLARPUB = '/scholar?hl=en&oi=bibs&cites={0}'
 _CITATIONPUBRE = r'citation_for_view=([\w-]*:[\w-]*)'
-_BIBCITE = '/scholar?q=info:{0}:scholar.google.com/\
+_BIBCITE = '/scholar?hl=en&q=info:{0}:scholar.google.com/\
 &output=cite&scirp={1}&hl=en'
-_CITEDBYLINK = '/scholar?cites={0}'
+_CITEDBYLINK = '/scholar?hl=en&cites={0}'
 _MANDATES_URL = '/citations?view_op=view_mandate&hl=en&citation_for_view={0}'
 
 _BIB_MAPPING = {
@@ -126,6 +126,13 @@ class PublicationParser(object):
                 and not year.text.isspace()
                 and len(year.text) > 0):
             publication['bib']['pub_year'] = year.text.strip()
+
+        author_citation = __data.find_all('div', class_='gs_gray')
+        try:
+            citation = author_citation[1].text
+        except IndexError:
+            citation = ""
+        publication['bib']['citation'] = citation
 
         return publication
 
@@ -337,6 +344,7 @@ class PublicationParser(object):
                     for entry in val.find_all('a'):
                         if entry.text.lower() == 'related articles':
                             publication['url_related_articles'] = entry.get('href')[26:]
+                            break
             # number of citation per year
             years = [int(y.text) for y in soup.find_all(class_='gsc_oci_g_t')]
             cites = [int(c.text) for c in soup.find_all(class_='gsc_oci_g_al')]
