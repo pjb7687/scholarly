@@ -11,6 +11,7 @@ import logging
 import random
 import time
 from requests.exceptions import Timeout
+from httpx import TimeoutException
 from selenium.webdriver.common.by import By
 from .publication_parser import _SearchScholarIterator
 from .author_parser import AuthorParser
@@ -73,12 +74,12 @@ class Navigator(object, metaclass=Singleton):
         self._session1 = self.pm1.get_session()
         self._session2 = self.pm2.get_session()
 
-    def _new_session(self, premium=True):
+    def _new_session(self, premium=True, **kwargs):
         self.got_403 = False
         if premium:
-            self._session1 = self.pm1._new_session()
+            self._session1 = self.pm1._new_session(**kwargs)
         else:
-            self._session2 = self.pm2._new_session()
+            self._session2 = self.pm2._new_session(**kwargs)
 
 
     def _get_page(self, pagerequest: str, premium: bool = False) -> str:
@@ -111,12 +112,21 @@ class Navigator(object, metaclass=Singleton):
                 w = random.uniform(1,2)
                 time.sleep(w)
                 resp = session.get(pagerequest, timeout=timeout)
-                self.logger.debug("Session proxy config is {}".format(session.proxies))
+                if premium is False:  # premium methods may contain sensitive information
+                    self.logger.debug("Session proxy config is {}".format(pm._proxies))
 
                 has_captcha = self._requests_has_captcha(resp.text)
 
                 if resp.status_code == 200 and not has_captcha:
                     return resp.text
+                elif resp.status_code == 404:
+                    # If the scholar_id was approximate, it first appears as
+                    # 404 (or 302), and then gets redirected to the correct profile.
+                    # In such cases, we need to try again with the same session.
+                    # See https://github.com/scholarly-python-package/scholarly/issues/469.
+                    self.logger.debug("Got a 404 error. Attempting with same proxy")
+                    tries += 1
+                    continue
                 elif has_captcha:
                     self.logger.info("Got a captcha request.")
                     session = pm._handle_captcha2(pagerequest)
@@ -138,6 +148,9 @@ class Navigator(object, metaclass=Singleton):
                         continue # Retry request within same session
                     else:
                         self.logger.info("We can use another connection... let's try that.")
+                elif resp.status_code == 302 and resp.has_redirect_location:
+                    self.logger.debug("Got a redirect.")
+                    pagerequest = resp.headers["location"]
                 else:
                     self.logger.info("""Response code %d.
                                     Retrying...""", resp.status_code)
@@ -149,7 +162,7 @@ class Navigator(object, metaclass=Singleton):
                     self.logger.info("Will retry after %.2f seconds (with the same session).", w)
                     time.sleep(w)
                     continue
-            except Timeout as e:
+            except (Timeout, TimeoutException) as e:
                 err = "Timeout Exception %s while fetching page: %s" % (type(e).__name__, e.args)
                 self.logger.info(err)
                 if timeout < 3*self._TIMEOUT:
@@ -164,7 +177,7 @@ class Navigator(object, metaclass=Singleton):
 
             tries += 1
             try:
-                session, timeout = pm.get_next_proxy(num_tries = tries, old_timeout = timeout, old_proxy=session.proxies.get('http', None))
+                session, timeout = pm.get_next_proxy(num_tries = tries, old_timeout = timeout, old_proxy=pm._proxies.get('http', None))
             except Exception:
                 self.logger.info("No other secondary connections possible. "
                                  "Using the primary proxy for all requests.")

@@ -1,24 +1,28 @@
 """scholarly.py"""
 import requests
+import re
 import os
 import copy
 import csv
 import pprint
-from typing import Dict, List
+import datetime
+import re
+from typing import Dict, List, Union
 from ._navigator import Navigator
 from ._proxy_generator import ProxyGenerator
 from dotenv import find_dotenv, load_dotenv
 from .author_parser import AuthorParser
 from .publication_parser import PublicationParser, _SearchScholarIterator
-from .data_types import Author, AuthorSource, Journal, Publication, PublicationSource
+from .data_types import Author, AuthorSource, CitesPerYear, Journal, Publication, PublicationSource
 
 _AUTHSEARCH = '/citations?hl=en&view_op=search_authors&mauthors={0}'
 _KEYWORDSEARCH = '/citations?hl=en&view_op=search_authors&mauthors=label:{0}'
 _KEYWORDSEARCHBASE = '/citations?hl=en&view_op=search_authors&mauthors={}'
+_KEYWORDSEARCH_PATTERN = "[-: #(),;]+"  # Unallowed characters in the keywords.
 _PUBSEARCH = '/scholar?hl=en&q={0}'
 _CITEDBYSEARCH = '/scholar?hl=en&cites={0}'
 _ORGSEARCH = "/citations?view_op=view_org&hl=en&org={0}"
-_MANDATES_URL = "https://scholar.google.com/citations?view_op=mandates_leaderboard_csv"
+_MANDATES_URL = "https://scholar.google.com/citations?view_op=mandates_leaderboard_csv&hl=en"
 
 
 class _Scholarly:
@@ -152,14 +156,14 @@ class _Scholarly:
         """
         url = self._construct_url(_PUBSEARCH.format(requests.utils.quote(query)), patents=patents,
                                   citations=citations, year_low=year_low, year_high=year_high,
-                                  sort_by=sort_by, start_index=start_index)
+                                  sort_by=sort_by, include_last_year=include_last_year, start_index=start_index)
         return self.__nav.search_publications(url)
 
-    def search_citedby(self, publication_id: int, **kwargs):
+    def search_citedby(self, publication_id: Union[int, str], **kwargs):
         """Searches by Google Scholar publication id and returns a generator of Publication objects.
 
         :param publication_id: Google Scholar publication id
-        :type publication_id: int
+        :type publication_id: int or str
 
         For the remaining parameters, see documentation of `search_pubs`.
         """
@@ -248,6 +252,25 @@ class _Scholarly:
             self.logger.warning("Object not supported for bibtex exportation")
             return
 
+    @staticmethod
+    def _bin_citations_by_year(cites_per_year: CitesPerYear, year_end):
+        years = []
+        y_hi, y_lo = year_end, year_end
+        running_count = 0
+        for y in sorted(cites_per_year, reverse=True):
+            if running_count + cites_per_year[y] <= 1000:
+                running_count += cites_per_year[y]
+                y_lo = y
+            else:
+                running_count = cites_per_year[y]
+                years.append((y_hi, y_lo))
+                y_hi = y
+
+        if running_count > 0:
+            years.append((y_hi, y_lo))
+
+        return years
+
     def citedby(self, object: Publication)->_SearchScholarIterator:
         """Searches Google Scholar for other articles that cite this Publication
         and returns a Publication generator.
@@ -255,12 +278,46 @@ class _Scholarly:
         :param object: The Publication object for the bibtex exportation
         :type object: Publication
         """
-        if object['container_type'] == "Publication":
-            publication_parser = PublicationParser(self.__nav)
-            return publication_parser.citedby(object)
-        else:
+
+        if object['container_type'] != "Publication":
             self.logger.warning("Object not supported for bibtex exportation")
             return
+
+        if object["num_citations"] <= 1000:
+            return PublicationParser(self.__nav).citedby(object)
+
+        self.logger.debug("Since the paper titled %s has %d citations (>1000), "
+                          "fetching it on an annual basis.", object["bib"]["title"], object["num_citations"])
+
+        year_end = int(datetime.date.today().year)
+
+        if object["source"] == PublicationSource.AUTHOR_PUBLICATION_ENTRY:
+            self.fill(object)
+            years = self._bin_citations_by_year(object.get("cites_per_year", {}), year_end)
+        else:
+            try:
+                year_low = int(object["bib"]["pub_year"])
+            except KeyError:
+                self.logger.warning("Unknown publication year for paper %s, may result in incorrect number "
+                                    "of citedby papers.", object["bib"]["title"])
+                return PublicationParser(self.__nav).citedby(object)
+
+            # Go one year at a time in decreasing order
+            years = zip(range(year_end, year_low-1, -1), range(year_end, year_low-1, -1))
+
+        return self._citedby_long(object,years)
+
+    def _citedby_long(self, object: Publication, years):
+        # Extract cites_id. Note: There could be multiple ones, separated by commas.
+        m = re.search("cites=[\d+,]*", object["citedby_url"])
+        pub_id = m.group()[6:]
+        for y_hi, y_lo in years:
+            sub_citations = self.search_citedby(publication_id=pub_id, year_low=y_lo, year_high=y_hi)
+            if sub_citations.total_results and (sub_citations.total_results > 1000):
+                self.logger.warn("The paper titled %s has %d citations in the year %d. "
+                                 "Due to the limitation in Google Scholar, fetching only 1000 results "
+                                 "from that year.", object["bib"]["title"], sub_citations.total_results, y_lo)
+            yield from sub_citations
 
     def search_author_id(self, id: str, filled: bool = False, sortby: str = "citedby", publication_limit: int = 0)->Author:
         """Search by author id and return a single Author object
@@ -321,7 +378,9 @@ class _Scholarly:
              'source': 'SEARCH_AUTHOR_SNIPPETS',
              'url_picture': 'https://scholar.google.com/citations?view_op=medium_photo&user=lHrs3Y4AAAAJ'}
         """
-        url = _KEYWORDSEARCH.format(requests.utils.quote(keyword))
+
+        reg_keyword = re.sub(_KEYWORDSEARCH_PATTERN, "_", keyword)
+        url = _KEYWORDSEARCH.format(requests.utils.quote(reg_keyword))
         return self.__nav.search_authors(url)
 
     def search_keywords(self, keywords: List[str]):
@@ -355,8 +414,8 @@ class _Scholarly:
                  'url_picture': 'https://scholar.google.com/citations?view_op=medium_photo&user=_cMw1IUAAAAJ'}
 
         """
-
-        formated_keywords = ['label:'+requests.utils.quote(keyword) for keyword in keywords]
+        reg_keywords = (re.sub(_KEYWORDSEARCH_PATTERN, "_", keyword) for keyword in keywords)
+        formated_keywords = ['label:'+requests.utils.quote(keyword) for keyword in reg_keywords]
         formated_keywords = '+'.join(formated_keywords)
         url = _KEYWORDSEARCHBASE.format(formated_keywords)
         return self.__nav.search_authors(url)
@@ -434,7 +493,7 @@ class _Scholarly:
                     del publication['container_type']
 
         del to_print['container_type']
-        print(pprint.pformat(to_print))
+        print(pprint.pformat(to_print).encode("utf-8"))
 
     def search_org(self, name: str, fromauthor: bool = False) -> list:
         """
@@ -485,7 +544,7 @@ class _Scholarly:
                               "setting overwrite=True")
         text = self.__nav._get_page(_MANDATES_URL, premium=False)
         if include_links:
-            soup = self.__nav._get_soup("/citations?view_op=mandates_leaderboard")
+            soup = self.__nav._get_soup("/citations?hl=en&view_op=mandates_leaderboard")
             text = text.replace("Funder,", "Funder,Policy,Cached,", 1)
             for agency in soup.find_all("td", class_="gsc_mlt_t"):
                 cached = agency.find("span", class_="gs_a").a["href"]

@@ -4,6 +4,7 @@ import random
 import logging
 import time
 import requests
+import httpx
 import tempfile
 import urllib3
 
@@ -13,7 +14,6 @@ from selenium.webdriver.common.by import By
 from selenium.common.exceptions import WebDriverException, UnexpectedAlertPresentException
 from selenium.webdriver.firefox.options import Options as FirefoxOptions
 from urllib.parse import urlparse
-from fake_useragent import UserAgent
 from contextlib import contextmanager
 from deprecated import deprecated
 try:
@@ -22,6 +22,13 @@ try:
     from stem.control import Controller
 except ImportError:
     stem = None
+
+try:
+    from fake_useragent import UserAgent
+    FAKE_USERAGENT = True
+except Exception:
+    FAKE_USERAGENT = False
+    DEFAULT_USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.149 Safari/537.36'
 
 from .data_types import ProxyMode
 
@@ -43,6 +50,7 @@ class ProxyGenerator(object):
         # If we use a proxy or Tor, we set this to True
         self._proxy_works = False
         self.proxy_mode = None
+        self._proxies = {}
         # If we have a Tor server that we can refresh, we set this to True
         self._tor_process = None
         self._can_refresh_tor = False
@@ -181,15 +189,29 @@ class ProxyGenerator(object):
         :returns: whether or not the proxy was set up successfully
         :rtype: {bool}
         """
+        if http[:4] != "http":
+            http = "http://" + http
         if https is None:
             https = http
+        elif https[:5] != "https":
+            https = "https://" + https
 
-        proxies = {'http': http, 'https': https}
-        self._proxy_works = self._check_proxy(proxies)
+        proxies = {'http://': http, 'https://': https}
+        if self.proxy_mode == ProxyMode.SCRAPERAPI:
+            r = requests.get("http://api.scraperapi.com/account", params={'api_key': self._API_KEY}).json()
+            if "error" in r:
+                self.logger.warning(r["error"])
+                self._proxy_works = False
+            else:
+                self._proxy_works = r["requestCount"] < int(r["requestLimit"])
+                self.logger.info("Successful ScraperAPI requests %d / %d",
+                                 r["requestCount"], r["requestLimit"])
+        else:
+            self._proxy_works = self._check_proxy(proxies)
 
         if self._proxy_works:
-            self._session.proxies = proxies
-            self._new_session()
+            self._proxies = proxies
+            self._new_session(proxies=proxies)
 
         return self._proxy_works
 
@@ -343,8 +365,8 @@ class ProxyGenerator(object):
     def _get_chrome_webdriver(self):
         if self._proxy_works:
             webdriver.DesiredCapabilities.CHROME['proxy'] = {
-                "httpProxy": self._session.proxies['http'],
-                "sslProxy": self._session.proxies['https'],
+                "httpProxy": self._proxies['http'],
+                "sslProxy": self._proxies['https'],
                 "proxyType": "MANUAL"
             }
 
@@ -359,8 +381,8 @@ class ProxyGenerator(object):
         if self._proxy_works:
             # Redirect webdriver through proxy
             webdriver.DesiredCapabilities.FIREFOX['proxy'] = {
-                "httpProxy": self._session.proxies['http'],
-                "sslProxy": self._session.proxies['https'],
+                "httpProxy": self._proxies['http'],
+                "sslProxy": self._proxies['https'],
                 "proxyType": "MANUAL",
             }
 
@@ -423,34 +445,45 @@ class ProxyGenerator(object):
         for cookie in self._get_webdriver().get_cookies():
             cookie.pop("httpOnly", None)
             cookie.pop("expiry", None)
+            cookie.pop("sameSite", None)
             self._session.cookies.set(**cookie)
 
         return self._session
 
-    def _new_session(self):
+    def _new_session(self, **kwargs):
+        init_kwargs = {"follow_redirects": True}
+        init_kwargs.update(kwargs)
         proxies = {}
         if self._session:
-            proxies = self._session.proxies
+            proxies = self._proxies
             self._close_session()
-        self._session = requests.Session()
+        # self._session = httpx.Client()
         self.got_403 = False
 
-        # Suppress the misleading traceback from UserAgent()
-        with self._suppress_logger('fake_useragent'):
-            _HEADERS = {
-                'accept-language': 'en-US,en',
-                'accept': 'text/html,application/xhtml+xml,application/xml',
-                'User-Agent': UserAgent().random,
-            }
-        self._session.headers.update(_HEADERS)
+        if FAKE_USERAGENT:
+            # Suppress the misleading traceback from UserAgent()
+            with self._suppress_logger('fake_useragent'):
+                user_agent = UserAgent().random
+        else:
+            user_agent = DEFAULT_USER_AGENT
+
+        _HEADERS = {
+            'accept-language': 'en-US,en',
+            'accept': 'text/html,application/xhtml+xml,application/xml',
+            'User-Agent': user_agent,
+        }
+        # self._session.headers.update(_HEADERS)
+        init_kwargs.update(headers=_HEADERS)
 
         if self._proxy_works:
-            self._session.proxies = proxies
+            init_kwargs["proxies"] = proxies #.get("http", None)
+            self._proxies = proxies
             if self.proxy_mode is ProxyMode.SCRAPERAPI:
                 # SSL Certificate verification must be disabled for
                 # ScraperAPI requests to work.
                 # https://www.scraperapi.com/documentation/
-                self._session.verify = False
+                init_kwargs["verify"] = False
+        self._session = httpx.Client(**init_kwargs)
         self._webdriver = None
 
         return self._session
@@ -472,7 +505,10 @@ class ProxyGenerator(object):
         freeproxy = FreeProxy(rand=False, timeout=timeout)
         if not hasattr(self, '_dirty_freeproxies'):
             self._dirty_freeproxies = set()
-        all_proxies = freeproxy.get_proxy_list()
+        try:
+            all_proxies = freeproxy.get_proxy_list(repeat=False)  # free-proxy >= 1.1.0
+        except TypeError:
+            all_proxies = freeproxy.get_proxy_list()  # free-proxy < 1.1.0
         all_proxies.reverse()  # Try the older proxies first
 
         t1 = time.time()
@@ -482,7 +518,7 @@ class ProxyGenerator(object):
                 all_proxies = freeproxy.get_proxy_list()
             if proxy in self._dirty_freeproxies:
                 continue
-            proxies = {'http': proxy, 'https': proxy}
+            proxies = {'http://': proxy, 'https://': proxy}
             proxy_works = self._check_proxy(proxies)
             if proxy_works:
                 dirty_proxy = (yield proxy)
@@ -562,6 +598,9 @@ class ProxyGenerator(object):
             self.logger.warning(r["error"])
             return False
 
+        self._API_KEY = API_KEY
+        self.proxy_mode = ProxyMode.SCRAPERAPI
+
         r["requestLimit"] = int(r["requestLimit"])
         self.logger.info("Successful ScraperAPI requests %d / %d",
                          r["requestCount"], r["requestLimit"])
@@ -571,7 +610,7 @@ class ProxyGenerator(object):
         # https://www.scraperapi.com/documentation/
         self._TIMEOUT = 60
 
-        prefix = "http://scraperapi"
+        prefix = "http://scraperapi.retry_404=true"
         if country_code is not None:
             prefix += ".country_code=" + country_code
         if premium:
@@ -585,9 +624,9 @@ class ProxyGenerator(object):
         for _ in range(3):
             proxy_works = self._use_proxy(http=f'{prefix}:{API_KEY}@proxy-server.scraperapi.com:8001')
             if proxy_works:
+                proxies = {'http://': f"{prefix}:{API_KEY}@proxy-server.scraperapi.com:8001",}
                 self.logger.info("ScraperAPI proxy setup successfully")
-                self.proxy_mode = ProxyMode.SCRAPERAPI
-                self._session.verify = False
+                self._new_session(verify=False, proxies=proxies)
                 return proxy_works
 
         if (r["requestCount"] >= r["requestLimit"]):
